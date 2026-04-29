@@ -1,6 +1,6 @@
 ---
 name: sissclaw-trader
-description: Autonomous Alpaca paper-trading momentum strategy with strict risk controls, scheduled weekday runs, and full trade-decision logging.
+description: Autonomous Alpaca paper-trading momentum strategy with mode-tiered leverage, TQQQ core, and selective overnight holds — built for a short-horizon competition where highest absolute return wins.
 allowed-tools:
   - bash
 ---
@@ -9,56 +9,70 @@ allowed-tools:
 
 ## Purpose
 
-`sissclaw-trader` runs an autonomous momentum strategy against the Alpaca paper trading API at `https://paper-api.alpaca.markets`.
+`sissclaw-trader` runs an autonomous momentum strategy against the Alpaca paper trading API at `https://paper-api.alpaca.markets`. Tuned for a multi-week competition: highest absolute % return wins, no real downside on paper losses, so the scoring rewards variance — especially when behind.
 
-It must authenticate using environment variables:
+Authenticates via env vars:
 - `APCA_API_KEY_ID`
 - `APCA_API_SECRET_KEY`
 
-## Schedule (EST, Weekdays)
+## Schedule (ET, Weekdays)
 
-Run on cron at:
-- `9:35 AM EST` (market session scan and entries)
-- `3:30 PM EST` (pre-close risk-off exit)
+- `9:35 AM` — entries (TQQQ core + momentum scan, or yolo single pick)
+- `3:30 PM` — EOD policy (selective flatten, or hard flatten depending on mode/day)
 
-Example cron expression (weekday-only):
+Cron:
 - `35 9 * * 1-5`
 - `30 15 * * 1-5`
 
-## Required Strategy Rules
+## Trading Modes (`TRADE_MODE` env var)
 
-1. Check US market hours before doing anything.
+Switch modes by setting `TRADE_MODE` before running. Default is `build`.
+
+| Mode | Per-position cap | Max names | TQQQ core | Use |
+|---|---|---|---|---|
+| `build` | 25% of equity | 4 | yes | Days 1–7 |
+| `tilt` | 50% of equity | 2 | yes | Catch-up, days 8–9 |
+| `yolo` | full intraday BP | 1 | no | Endgame, only when behind |
+| `lock` | 0% | 0 | no | Endgame, when leading — flatten and sit |
+
+## Strategy Rules
+
+1. Verify market is open before any action (override with `--force`).
 2. Verify account buying power before every trade.
-3. Scan the top 20 most active S&P 500 stocks.
-4. Buy only symbols up 2% to 5% from previous close.
-5. Never allocate more than 10% of total equity to one position.
-6. Attach hard exits to every entry:
-    - stop-loss: 2% below entry
-    - take-profit: 4% above entry
-7. At `3:30 PM EST`, sell all open positions before market close.
-8. Log every trade decision (buy, skip, sell) with a specific reason.
+3. Scan top 20 most-active stocks from Alpaca's screener.
+4. Buy only symbols up **1% to 5%** from previous close (the momentum entry band).
+5. Per-position cap is mode-dependent (see table). Cap also bounds the open-position count.
+6. Bracket every individual-name entry:
+   - stop-loss: 2% below entry
+   - take-profit: 4% above entry
+7. **TQQQ core** (build/tilt only): if SPY is up ≥ 0.30% at the morning run, hold ~30% of equity in TQQQ. No bracket — TQQQ rides; risk is managed by the EOD policy. Allocation grows on green days as equity grows (concentrating into momentum).
+8. **EOD policy at 3:30 PM**:
+   - Friday → flatten everything (no weekend gap risk).
+   - `yolo` or `lock` mode → flatten everything.
+   - Otherwise (build/tilt M–Th) → **hold green positions overnight, flatten red ones.** Captures momentum drift while containing losses.
+9. **Yolo mode**: at 9:35, pick the single best mover from the most-actives list (no upper band cap), enter with full daytrading buying power (~4× equity), no bracket. Flattens at 3:30 same day. Use only when behind on the final day(s).
+10. **Lock mode**: flatten everything on next run, sit in cash until mode is changed.
+11. Every decision (buy/sell/hold/skip/info) is logged with reason, mode, and metrics.
 
 ## Execution Outline
 
 1. Pull account + clock state from Alpaca.
-2. Abort with log entry if market is closed.
-3. At morning run:
-    - fetch top 20 most active S&P 500 symbols,
-    - compute percent change from previous close,
-    - filter to 2-5% gainers,
-    - size each candidate with max position cap (10% of equity),
-    - re-check buying power immediately before order submit,
-    - submit buy + protective stop-loss/take-profit orders,
-    - log action and rationale.
-4. At `3:30 PM EST` run:
-    - liquidate all open positions,
-    - log each close action and reason (`end_of_day_flatten`).
+2. Abort with log entry if market is closed (unless `--force`).
+3. If `TRADE_MODE=lock`: flatten everything and exit.
+4. If past 15:29 ET: run EOD policy and exit.
+5. If `TRADE_MODE=yolo`: pick single best mover, dump intraday BP, exit.
+6. Otherwise (build/tilt morning):
+   - TQQQ core step (enter/hold/skip based on SPY tape).
+   - Momentum scan: top 20 most-actives → 1–5% gainer band → mode-sized bracket buy → log.
 
-## Logging Requirements
+## Logging
 
-Every decision should include:
-- timestamp (EST)
-- symbol
-- action (`buy` | `sell` | `skip`)
-- reason (e.g., `outside_gain_band`, `insufficient_buying_power`, `max_position_cap`, `eod_exit`)
-- key metrics used (equity, buying power, change %, calculated size)
+Each line is one JSON object with fields:
+- `timestamp` (ISO 8601 ET)
+- `symbol`
+- `action` — `buy` | `sell` | `hold` | `skip` | `info`
+- `reason` — e.g. `momentum_entry`, `tqqq_core_entry`, `outside_gain_band`, `max_position_cap`, `overnight_hold_green`, `friday_flatten_all`, `yolo_entry`, `end_of_day_red_flatten`
+- `mode` — current `TRADE_MODE`
+- `details` — equity, buying power, change %, qty, prices, etc.
+
+Logs land in `logs/trade-decisions.log` (gitignored).
