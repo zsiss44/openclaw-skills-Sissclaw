@@ -90,14 +90,15 @@ is_friday_et() {
 }
 
 json_escape() {
-  jq -Rsa . <<<"$1"
+  jq -n --arg s "$1" '$s'
 }
 
 log_decision() {
   local symbol="$1"
   local action="$2"
   local reason="$3"
-  local details="${4:-{}}"
+  local details="${4-}"
+  [[ -z "$details" ]] && details='{}'
   local ts
   ts="$(TZ=America/New_York date -Iseconds)"
   printf '{"timestamp":"%s","symbol":"%s","action":"%s","reason":%s,"mode":"%s","details":%s}\n' \
@@ -128,6 +129,20 @@ trading_post() {
     "$TRADING_BASE_URL$1"
 }
 
+cancel_open_orders_for() {
+  local symbol="$1" orders_json
+  if ! orders_json="$(trading_get "/v2/orders?status=open&symbols=${symbol}&limit=50")"; then
+    return 0
+  fi
+  jq -r '.[]?.id // empty' <<<"$orders_json" | while read -r oid; do
+    [[ -z "$oid" ]] && continue
+    curl -sS -X DELETE \
+      -H "APCA-API-KEY-ID: $APCA_API_KEY_ID" \
+      -H "APCA-API-SECRET-KEY: $APCA_API_SECRET_KEY" \
+      "$TRADING_BASE_URL/v2/orders/${oid}" >/dev/null 2>&1 || true
+  done
+}
+
 flatten_symbol() {
   local symbol="$1" qty="$2" reason="$3"
   local abs_qty payload response
@@ -136,6 +151,7 @@ flatten_symbol() {
     log_decision "$symbol" "skip" "invalid_position_qty" "{}"
     return
   fi
+  cancel_open_orders_for "$symbol"
   payload="$(jq -nc --arg symbol "$symbol" --arg qty "$abs_qty" \
     '{symbol:$symbol, qty:$qty, side:"sell", type:"market", time_in_force:"day"}')"
   if [[ "$DRY_RUN" == "true" ]]; then
@@ -183,7 +199,8 @@ eod_step() {
 }
 
 submit_bracket_buy() {
-  local symbol="$1" qty="$2" entry_price="$3" reason="$4" details_extra="${5:-{}}"
+  local symbol="$1" qty="$2" entry_price="$3" reason="$4" details_extra="${5-}"
+  [[ -z "$details_extra" ]] && details_extra='{}'
   local stop_price take_profit_price order_payload order_response details
   stop_price="$(awk -v p="$entry_price" -v pct="$STOP_LOSS_PCT" 'BEGIN { printf "%.2f", p * (1 - pct) }')"
   take_profit_price="$(awk -v p="$entry_price" -v pct="$TAKE_PROFIT_PCT" 'BEGIN { printf "%.2f", p * (1 + pct) }')"
