@@ -240,6 +240,11 @@ tqqq_core_step() {
     log_decision "TQQQ" "skip" "spy_snapshot_fetch_failed" "{}"
     return
   fi
+  if declare -F protection_validate_snapshot >/dev/null && \
+     ! protection_validate_snapshot "$spy_snapshot" "SPY"; then
+    log_decision "TQQQ" "skip" "spy_snapshot_stale" "{}"
+    return
+  fi
   spy_prev="$(jq -r '.SPY.prevDailyBar.c // 0' <<<"$spy_snapshot")"
   spy_last="$(jq -r '.SPY.latestTrade.p // .SPY.dailyBar.c // 0' <<<"$spy_snapshot")"
   if [[ "$(awk -v p="$spy_prev" -v l="$spy_last" 'BEGIN {print (p <= 0 || l <= 0)}')" -eq 1 ]]; then
@@ -270,6 +275,11 @@ tqqq_core_step() {
     log_decision "TQQQ" "skip" "tqqq_snapshot_fetch_failed" "{}"
     return
   fi
+  if declare -F protection_validate_snapshot >/dev/null && \
+     ! protection_validate_snapshot "$snapshot" "TQQQ"; then
+    log_decision "TQQQ" "skip" "tqqq_snapshot_stale" "{}"
+    return
+  fi
   last_price="$(jq -r '.TQQQ.latestTrade.p // .TQQQ.dailyBar.c // 0' <<<"$snapshot")"
   if [[ "$(awk -v l="$last_price" 'BEGIN {print (l <= 0)}')" -eq 1 ]]; then
     log_decision "TQQQ" "skip" "tqqq_invalid_price" "{}"
@@ -295,6 +305,9 @@ tqqq_core_step() {
     log_decision "TQQQ" "skip" "tqqq_quantity_below_one_share" "$(jq -nc --arg target "$target_notional" --arg last "$last_price" '{target:$target,last:$last}')"
     return
   fi
+
+  declare -F protection_gross_exposure_or_die >/dev/null && \
+    protection_gross_exposure_or_die "$target_notional"
 
   local payload response
   payload="$(jq -nc --arg symbol "TQQQ" --arg qty "$qty" '{symbol:$symbol,qty:$qty,side:"buy",type:"market",time_in_force:"day"}')"
@@ -349,6 +362,11 @@ scan_and_enter_momentum() {
       log_decision "$symbol" "skip" "snapshot_fetch_failed" "{}"
       continue
     fi
+    if declare -F protection_validate_snapshot >/dev/null && \
+       ! protection_validate_snapshot "$snapshot_json" "$symbol"; then
+      log_decision "$symbol" "skip" "snapshot_stale" "{}"
+      continue
+    fi
     snapshot_data="$(jq -r ".[\"${symbol}\"] // {}" <<<"$snapshot_json")"
     prev_close="$(jq -r '.prevDailyBar.c // 0' <<<"$snapshot_data")"
     last_price="$(jq -r '.latestTrade.p // .dailyBar.c // 0' <<<"$snapshot_data")"
@@ -392,6 +410,9 @@ scan_and_enter_momentum() {
       continue
     fi
 
+    declare -F protection_gross_exposure_or_die >/dev/null && \
+      protection_gross_exposure_or_die "$target_notional"
+
     extra="$(jq -nc --arg equity "$equity" --arg buying_power "$buying_power" --arg change_pct "$change_pct" '{equity:$equity,buying_power:$buying_power,change_pct:$change_pct}')"
     if submit_bracket_buy "$symbol" "$qty" "$last_price" "momentum_entry" "$extra"; then
       open_count=$((open_count + 1))
@@ -416,6 +437,8 @@ yolo_entry() {
     [[ -z "$symbol" ]] && continue
     local snapshot_json prev_close last_price change_pct
     if ! snapshot_json="$(data_get "/v2/stocks/snapshots?symbols=${symbol}")"; then continue; fi
+    if declare -F protection_validate_snapshot >/dev/null && \
+       ! protection_validate_snapshot "$snapshot_json" "$symbol"; then continue; fi
     prev_close="$(jq -r ".[\"${symbol}\"].prevDailyBar.c // 0" <<<"$snapshot_json")"
     last_price="$(jq -r ".[\"${symbol}\"].latestTrade.p // .[\"${symbol}\"].dailyBar.c // 0" <<<"$snapshot_json")"
     if [[ "$(awk -v p="$prev_close" -v l="$last_price" 'BEGIN {print (p <= 0 || l <= 0)}')" -eq 1 ]]; then continue; fi
@@ -441,6 +464,9 @@ yolo_entry() {
     return
   fi
 
+  declare -F protection_gross_exposure_or_die >/dev/null && \
+    protection_gross_exposure_or_die "$buying_power"
+
   payload="$(jq -nc --arg symbol "$best_symbol" --arg qty "$qty" '{symbol:$symbol,qty:$qty,side:"buy",type:"market",time_in_force:"day"}')"
   if [[ "$DRY_RUN" == "true" ]]; then
     log_decision "$best_symbol" "buy" "dry_run_yolo_entry" "$(jq -nc --arg qty "$qty" --arg change "$best_change" --arg target "$buying_power" --argjson payload "$payload" '{qty:$qty,change_pct:$change,target_notional:$target,simulated_order:$payload}')"
@@ -455,6 +481,15 @@ main() {
   local run_mode="live"
   [[ "$DRY_RUN" == "true" ]] && run_mode="dry_run"
   log_decision "SYSTEM" "info" "run_start" "$(jq -nc --arg run "$run_mode" --arg force "$FORCE_RUN" '{run_mode:$run,force:$force}')"
+
+  local protection_lib="$SKILL_DIR/../trader-protection/scripts/check.sh"
+  if [[ -f "$protection_lib" ]]; then
+    # shellcheck disable=SC1090
+    source "$protection_lib"
+    protection_init
+    protection_kill_switch_or_die
+    protection_acquire_lock_or_die
+  fi
 
   local clock_json is_open
   clock_json="$(trading_get "/v2/clock")"
@@ -478,6 +513,18 @@ main() {
   if [[ "$et_hm" > "15:29" ]]; then
     eod_step
     exit 0
+  fi
+
+  # Equity-based protection runs only on the entry paths (yolo / build+tilt morning).
+  # EOD and lock flatten paths intentionally bypass these so a drawdown breach can
+  # still close out positions instead of leaving them stuck open.
+  if declare -F protection_drawdown_or_die >/dev/null; then
+    local pre_account_json pre_equity
+    pre_account_json="$(trading_get "/v2/account")"
+    pre_equity="$(jq -r '.equity' <<<"$pre_account_json")"
+    protection_drawdown_or_die "$pre_equity"
+    protection_daily_loss_or_die "$pre_equity"
+    protection_record_equity "$pre_equity"
   fi
 
   if [[ "$TRADE_MODE" == "yolo" ]]; then
